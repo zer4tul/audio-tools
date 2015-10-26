@@ -81,7 +81,6 @@ def which(program):
     return None
 
 # returns variance of list
-@profile
 def variance(listx):
     meanx = numpy.mean(listx)
     # get mean of x^2
@@ -95,7 +94,6 @@ def variance(listx):
     return meanx_sqr - meanx**2
 
 # returns correlation between lists
-@profile
 def correlation(listx, listy):
     if len(listx) == 0 or len(listy) == 0:
         # Error checking in main program should prevent us from ever being
@@ -115,7 +113,6 @@ def correlation(listx, listy):
 
 
 # return cross correlation, with listy offset from listx
-@profile
 def cross_correlation(listx, listy, offset):
     if offset > 0:
         listx = listx[offset:]
@@ -131,7 +128,6 @@ def cross_correlation(listx, listy, offset):
     return correlation(listx, listy)
 
 # cross correlate listx and listy with offsets from -span to span
-@profile
 def compare(listx, listy, span, step):
     if span > min(len(listx), len(listy)):
         # Error checking in main program should prevent us from ever being
@@ -185,7 +181,6 @@ def find_audio(path):
     return result
 
 # caculate fingerprint of a file
-@profile
 def fpcalc(filename, fpcalc_exec):
     fpcalc_out = subprocess.check_output([fpcalc_exec, '-raw', '-length',
                                     str(sample_time), filename], shell=False)
