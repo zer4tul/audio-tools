@@ -1,0 +1,364 @@
+#!/usr/bin/env python
+
+################################################################################
+# import modules
+################################################################################
+
+import re
+import subprocess
+import numpy
+import math
+import sys
+import time
+import os
+import audioread
+import multiprocessing
+
+# directories to compare files between
+# set to the same directory to compare files between themselves
+# file to write matches to
+match_file = 'matches.txt'
+# seconds to sample audio file for
+sample_time = 240
+# number of points to crop from beginning of fingerprint
+# 4096 samples per frame / 11025 samples per second / 3 points per frame
+# = 0.124 seconds per point
+crop = 450
+# number of points to scan cross correlation over
+span = 600
+# step size (in points) of cross correlation
+step = 3
+# report match when cross correlation has a peak exceeding threshold
+threshold = 0.8
+# minimum number of points that must overlap in cross correlation
+# exception is raised if this cannot be met
+min_overlap = 200
+
+
+################################################################################
+# class definitions
+################################################################################
+class FingerprintTooShort(Exception):
+    def __init__(self, value):
+        self.value = value
+
+################################################################################
+# function definitions
+################################################################################
+
+# argument parser
+
+def optparser():
+    import argparse
+    parser = argparse.ArgumentParser(description="Compare and find duplicate audio file(s).")
+    parser.add_argument('directory', metavar="DIR", type=str)
+    parser.add_argument('-d', '--diff', '--diff-with', metavar="DIR", type=str,
+                        help="Directories to be diff with.")
+    parser.add_argument('-e', '--execute', metavar="fpcalc_exec", type=str, default="",
+                        help="Path to fingerprint tool (fpcalc).")
+    parser.add_argument('-p', '--parallel', type=int, default=multiprocessing.cpu_count(),
+                        help="""Number of processes started parallelly.
+                        Default: %s)""" % multiprocessing.cpu_count())
+    return parser.parse_args()
+
+# which command
+
+def which(program):
+    import os
+    def is_exe(fpath):
+        return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+
+    fpath, fname = os.path.split(program)
+    if fpath:
+        if is_exe(program):
+            return program
+    else:
+        for path in os.environ["PATH"].split(os.pathsep):
+            path = path.strip('"')
+            exe_file = os.path.join(path, program)
+            if is_exe(exe_file):
+                return exe_file
+    return None
+
+# returns variance of list
+@profile
+def variance(listx):
+    meanx = numpy.mean(listx)
+    # get mean of x^2
+    meanx_sqr = 0
+    #arrayx = numpy.array(listx)
+    #meanx_sqr = sum(map(lambda x: int(x), arrayx * arrayx))
+    meanx_sqr = sum(map(lambda x: x * x, listx))
+    #for x in listx:
+    #    meanx_sqr += x**2
+    meanx_sqr = meanx_sqr / float(len(listx))
+    return meanx_sqr - meanx**2
+
+# returns correlation between lists
+@profile
+def correlation(listx, listy):
+    if len(listx) == 0 or len(listy) == 0:
+        # Error checking in main program should prevent us from ever being
+        # able to get here.
+        raise Exception('Empty lists cannot be correlated.')
+    if len(listx) > len(listy):
+        listx = listx[:len(listy)]
+    elif len(listx) < len(listy):
+        listy = listy[:len(listx)]
+
+    meanx = numpy.mean(listx)
+    meany = numpy.mean(listy)
+
+    covariance = numpy.sum(map(lambda x,y: (x - meanx) * (y - meany), listx, listy))
+    covariance = covariance / float(len(listx))
+    return covariance / (math.sqrt(variance(listx)) * math.sqrt(variance(listy)))
+
+
+# return cross correlation, with listy offset from listx
+@profile
+def cross_correlation(listx, listy, offset):
+    if offset > 0:
+        listx = listx[offset:]
+        listy = listy[:len(listx)]
+    elif offset < 0:
+        offset = -offset
+        listy = listy[offset:]
+        listx = listx[:len(listy)]
+    if min(len(listx), len(listy)) < min_overlap:
+        # Error checking in main program should prevent us from ever being
+        # able to get here.
+        raise Exception('Overlap too small: %i' % min(len(listx), len(listy)))
+    return correlation(listx, listy)
+
+# cross correlate listx and listy with offsets from -span to span
+@profile
+def compare(listx, listy, span, step):
+    if span > min(len(listx), len(listy)):
+        # Error checking in main program should prevent us from ever being
+        # able to get here.
+        raise Exception('span >= sample size: %i >= %i\n'
+                        % (span, min(len(listx), len(listy)))
+                        + 'Reduce span, reduce crop or increase sample_time.')
+    corr_xy = []
+    #for offset in numpy.arange(-span, span + 1, step):
+    #    corr_xy.append(cross_correlation(listx, listy, offset))
+    corr_xy = map(lambda x: cross_correlation(listx, listy, x), numpy.arange(-span, span + 1, step))
+    return corr_xy
+
+# return index of maximum value in list
+def max_index(listx):
+    max_index = 0
+    listx_clone = listx
+    listx_clone.sort()
+    max_value = listx_clone[-1]
+    max_index = listx.index(max_value)
+#    max_index = 0
+#    max_value = listx[0]
+#    for i, value in enumerate(listx):
+#        if value > max_value:
+#            max_value = value
+#            max_index = i
+    return max_index
+
+# write to a file
+def write_string(string, filename):
+    file_out = open(filename, 'ab')
+    file_out.write(string + '\n')
+    file_out.close()
+
+# find supported audio files in specified directory(s)
+
+def find_audio(path):
+    supported_files = ['mp3', 'flac', 'wav']
+    result = []
+    if os.path.isdir(path):
+        for item in os.listdir(path):
+            filename = os.path.join(path,item)
+            ext = filename.rsplit(os.path.extsep,1)[1].lower()
+            if (ext in supported_files):
+                result.append(filename)
+    elif os.path.isfile(path):
+        filename = path
+        ext = filename.rsplit(os.path.extsep,1)[1].lower()
+        if (ext in supported_files):
+            result.append(filename)
+    return result
+
+# caculate fingerprint of a file
+@profile
+def fpcalc(filename, fpcalc_exec):
+    fpcalc_out = subprocess.check_output([fpcalc_exec, '-raw', '-length',
+                                    str(sample_time), filename], shell=False)
+    fp_index = fpcalc_out.find('FINGERPRINT=') + 12
+    # convert fingerprint to list of integers
+    fp = map(int, fpcalc_out[fp_index:].split(','))
+    # check that fingerprint length meets minimum size
+    if len(fp) - crop - span < min_overlap:
+        raise FingerprintTooShort('Fingerprint length less than required:\n'
+                        + 'File: %s\n' % FILE
+                        + 'Fingerprint length: %i\n' % len(fp)
+                        + 'Required length (crop + span + min_overlap): %i\n'
+                        % (crop + span + min_overlap)
+                        + 'Increase sample_time, reduce span or reduce crop.')
+    return (filename, fp)
+
+def update_progress(progressbar):
+    progressbar = progressbar + 1
+    progressbar.show_progress()
+
+class ProgressBar(object):
+    """ProgressBar class holds the options of the progress bar.
+    The options are:
+        start   State from which start the progress. For example, if start is
+                5 and the end is 10, the progress of this state is 50%
+        end     State in which the progress has terminated.
+        width   --
+        fill    String to use for "filled" used to represent the progress
+        blank   String to use for "filled" used to represent remaining space.
+        format  Format
+        incremental
+    """
+    def __init__(self, start=0, end=10, width=12, fill='=', blank='.', format='[%(fill)s>%(blank)s] %(progress).2f%%', incremental=True):
+        super(ProgressBar, self).__init__()
+
+        self.start = start
+        self.end = end
+        self.width = width
+        self.fill = fill
+        self.blank = blank
+        self.format = format
+        self.incremental = incremental
+        self.step = 100 / float(width) #fix
+        self.reset()
+
+    def __add__(self, increment):
+        increment = self._get_progress(increment)
+        if 100 > self.progress + increment:
+            self.progress += increment
+        else:
+            self.progress = 100
+        return self
+
+    def __str__(self):
+        progressed = int(self.progress / self.step) #fix
+        fill = progressed * self.fill
+        blank = (self.width - progressed) * self.blank
+        return self.format % {'fill': fill, 'blank': blank, 'progress': self.progress}
+
+    __repr__ = __str__
+
+    def _get_progress(self, increment):
+        return float(increment * 100) / self.end
+
+    def reset(self):
+        """Resets the current progress to the start point"""
+        self.progress = self._get_progress(self.start)
+        return self
+
+class AnimatedProgressBar(ProgressBar):
+    """Extends ProgressBar to allow you to use it straighforward on a script.
+    Accepts an extra keyword argument named `stdout` (by default use sys.stdout)
+    and may be any file-object to which send the progress status.
+    """
+    def __init__(self, *args, **kwargs):
+        super(AnimatedProgressBar, self).__init__(*args, **kwargs)
+        self.stdout = kwargs.get('stdout', sys.stdout)
+
+    def show_progress(self):
+        if hasattr(self.stdout, 'isatty') and self.stdout.isatty():
+            self.stdout.write('\r')
+        else:
+            self.stdout.write('\n')
+        self.stdout.write(str(self))
+        self.stdout.flush()
+
+################################################################################
+# main code
+################################################################################
+
+parser = optparser()
+intra_correlating = True
+
+# escape Bash special characters
+dir_a = parser.directory
+
+if parser.diff and (parser.directory <> parser.diff):
+    intra_correlating = False
+    dir_b = parser.diff
+else:
+    dir_b = parser.directory
+
+fpcalc_exec = None
+if parser.execute:
+    fpcalc_exec = parser.execute
+else:
+    fpcalc_exec = which('fpcalc')
+if not fpcalc_exec:
+    raise Exception('Fingerprint tool not found in $PATH')
+
+# get list of files to compare from each directory
+filelist_a = find_audio(dir_a)
+filelist_b = find_audio(dir_b)
+
+# initialize progress bar
+if intra_correlating == True:
+    length = len(filelist_a) * 2 - 1
+else:
+    length = len(filelist_a) * 2 + len(filelist_b)
+
+progressbar = AnimatedProgressBar(start = 0, end = length, width = 80)
+
+fplist_a = []
+fplist_b = []
+
+# TODO: impliment comparing in multiprocess
+#pool = multiprocessing.Pool(processes = parser.parallel, initializer=update_progress, initargs=[progressbar])
+#
+#try:
+#    fplist_a = pool.map(fpcalc, filelist_a)
+#except KeyboardInterrupt:
+#    pool.terminate()
+#
+#try:
+#    fplist_b = pool.map(fpcalc, filelist_b)
+#except KeyboardInterrupt:
+#    pool.terminate()
+
+for FILE in filelist_a:
+    try:
+        fplist_a.append(fpcalc(FILE, fpcalc_exec))
+    except FingerprintTooShort:
+        continue
+    progressbar + 1
+    progressbar.show_progress()
+
+if intra_correlating == False:
+    for FILE in filelist_b:
+        try:
+            fplist_b.append(fpcalc(FILE, fpcalc_exec))
+        except FingerprintTooShort:
+            continue
+        progressbar + 1
+        progressbar.show_progress()
+
+for i, (file_a, fingerprint_a) in enumerate(fplist_a):
+    if intra_correlating:
+        # remove files already correlated with from filelist_b, along with
+        # current file
+        fplist_b = fplist_a[i+1:]
+    for file_b, fingerprint_b in fplist_b:
+        # cross correlation between fingerprints
+        corr_ab = compare(fingerprint_a[crop:], fingerprint_b[crop:], span, step)
+        max_corr_index = max_index(corr_ab)
+        max_corr_offset = -span + max_corr_index * step
+
+        # report matches
+        if corr_ab[max_corr_index] > threshold:
+            print('%s and %s match with correlation of %.2f%% at offset %i'
+                  % (file_a, file_b, corr_ab[max_corr_index]*100, max_corr_offset))
+            write_string('%s\t%s\t%.6f\t%i'
+                         % (file_a, file_b, corr_ab[max_corr_index],
+                            max_corr_offset),
+                         match_file)
+    progressbar + 1
+    progressbar.show_progress()
