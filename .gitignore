@@ -1,6 +1,12 @@
+# acoustid fingerprint binary file
+fpcalc
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+
+# kernprof output
+*.lprof
 
 # C extensions
 *.so
